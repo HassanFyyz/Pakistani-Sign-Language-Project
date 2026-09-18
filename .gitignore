@@ -1,0 +1,15 @@
+# Datasets — too large / not meant for git
+PSL_Fingerspelling_Video_Dataset_Cropped/
+PSL_Fingerspelling_Video_Dataset_Cropped_Mirrored/
+PSL_Fingerspelling_Video_Dataset_Cropped*.zip
+hand_keypoints_features.csv
+
+# Scripts converted to notebooks — keep notebook as source of truth
+sofi_segmentation.py
+
+# Common Python/Jupyter junk
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
