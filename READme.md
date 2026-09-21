@@ -37,6 +37,12 @@
 
    *Negative control worth keeping:* `mean_pick_depth` looks like a great label-quality gate (deepest quartile 25.9% vs shallowest 9.0%) — but the effect **vanishes entirely** when signer4-L is excluded (4.7% → 8.6%, no trend), because it supplies 184 of 270 occurrences in that quartile. Do not use it as a filter on the strength of the pooled table.
 
+9. **Stage-1 demo app built: live segmentation in the browser** (`sofi_streaming.py`, `streaming_segmentation.ipynb`, `web/`). Algorithm 2 is offline — centred smoothing, a ±`run` minimum test, and `min_sep` of lookahead before a minimum can be confirmed — so it cannot be ported to a live loop naively. Two findings, both of which would have quietly broken a demo:
+   - **Causal port costs almost nothing.** Running the same algorithm on a fixed 15-frame (300ms @50fps) delay matches the offline version on 87% of clips exactly, with 97% of matched holds landing on the identical frame, and segment-count MAE 1.23 vs 1.19. **Real-time is not what limits this pipeline.**
+   - **The parameters are frame counts tuned at 50fps, and a webcam is 30fps.** Reusing them as frame counts degrades MAE to **2.61 at 30fps** (exact-count 32% → 2.8%) and **4.56 at 15fps — worse than the Algorithm 1 baseline we're trying to beat**. Expressing them as durations and converting at runtime holds MAE at ~1.2 across 50/30/25fps. This is a unit bug that would have looked like "the demo just isn't very good."
+
+   Architecture is browser-side: MediaPipe Hands in the tab → keypoints → segmenter in JS → only cropped hold frames go to a backend. No video leaves the client. The JS port is verified byte-identical to Python across 50 cases / 9,958 frames (`web/test_parity.mjs`, re-run automatically by the notebook). The page deliberately does **not** show letter predictions, since there is no model that honestly generalizes yet.
+
 **Immediate next actions (in progress or queued):**
 - [ ] **Train a small CNN on the hand crops at the segmented hold frames** — the crops already exist, the segmenter already says which frames to use, and the result above says appearance is where the missing signal must be. This is the direct next experiment.
 - [ ] Human spot-check of `spot_check/*.png` (needs someone who reads Urdu + knows PSL handshapes) to put a number on pseudo-label noise. Two sheets inspected informally look clean — distinct, settled handshapes matching the captions.
@@ -61,6 +67,9 @@ Run the notebooks in this order; each depends on the artifacts of the previous o
 | `sofi_algorithm2.ipynb` | Algorithm 2 validation: strict vs tolerant, parameter sweep, vs Algorithm 1, LOSO |
 | `pseudo_labeling.ipynb` | Builds the pseudo-labels, diagnostics, exports, and the spot-check contact sheets |
 | `letter_classifier.ipynb` | Letter classification + the negative result and its controls |
+| `sofi_streaming.py` | **Causal** Algorithm 2 for live input. Parameters in *seconds*, not frames |
+| `streaming_segmentation.ipynb` | Streaming-vs-offline parity, framerate transfer, browser parity test |
+| `web/` | Stage-1 demo app: live segmentation in the browser (`web/README.md` to run it) |
 | `pseudo_labels.csv` | Frame → letter / `<TRANS>` / null. `frame_id` indexes the video directly |
 | `pseudo_label_clips.csv` | Per-clip diagnostics (`alignment_confidence`, `mean_pick_depth`, `constraint_dominated`, quality score) |
 | `pseudo_label_segments.csv` | Per-letter segment bounds and chosen minimum frame |
@@ -155,7 +164,7 @@ The end deliverable is a **live camera → segmented video → recognized letter
 | **Polished/sharable app** | Web app: React frontend (browser webcam via `getUserMedia`) + FastAPI backend serving the model, with a WebSocket stream for near-real-time frame-by-frame recognition | Needed if a smooth, sub-second-latency live demo is required for a proper defense/demo day; browsers handle continuous video capture much better than repeated file uploads |
 | **If true real-time/offline/mobile is required** | Export detection model to **ONNX** or **TensorRT** for speed, or **TensorFlow Lite** for an on-device mobile version | Only worth the added complexity if live, low-latency, or offline deployment is explicitly part of the DRP scope (this pipeline is meant to eventually run in real time, so this is a realistic later step) |
 
-**Recommendation for DRP timeline:** start with **Gradio + webcam streaming** to validate the improved pipeline end-to-end quickly, then migrate to **React + FastAPI (WebSocket streaming)** once the model side is stable, since real-time responsiveness is central to this project's actual use case (unlike the isolated-letter benchmark, which was purely an offline evaluation exercise).
+**Superseded — see Progress Log #9.** Streaming video to a Python backend turned out to be the wrong design. MediaPipe Hands runs *in the browser*, so hand tracking and segmentation happen client-side and only the handful of cropped hold frames per word ever need a backend. That removes the WebSocket-video plumbing entirely, keeps latency low, and means no video leaves the user's machine. Stage 1 of this is built and running in `web/`.
 
 ---
 
@@ -171,7 +180,7 @@ The end deliverable is a **live camera → segmented video → recognized letter
 - [ ] Extend to dynamic/motion letters
 - [ ] Try landmark-based classification to reduce background dependence
 - [ ] Address confusable letter pairs
-- [ ] Build demo app (Gradio webcam first → React/FastAPI + WebSocket if needed)
+- [~] Build demo app — *Stage 1 done: live browser segmentation in `web/`, streaming port validated against the offline algorithm and across framerates. Stage 2 (letter CNN on hold crops) and Stage 3 (CTC decoding + per-user calibration) pending a working classifier*
 - [ ] Write up: how much did we close the generalization gap vs. the original pipeline?
 
 *(`[~]` = in progress / partially done, `[ ]` = not started, `[x]` = done — update as you go)*
