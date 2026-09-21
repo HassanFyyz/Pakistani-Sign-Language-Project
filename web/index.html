@@ -130,6 +130,20 @@ let lastTs = -1;
 const WARMUP_FRAMES = 20, FPS_SAMPLES = 30;
 let intervals = [], warmup = 0, lastFrameTs = 0, measuredFps = 0;
 
+// The rate also has to be re-checked forever, not measured once. The first
+// estimate is taken before the segmenter exists, so it misses the per-frame
+// cost of push()/drawTrace(); and browser throughput drifts with load. A
+// segmenter built for 25 fps but fed 16 fps has windows ~60% too long in real
+// time, which is the same unit bug as reusing 50 fps frame counts, just
+// quieter. Re-measure continuously and rebuild on sustained drift.
+const RECHECK_EVERY = 60, DRIFT_TOLERANCE = 0.15;
+let recent = [], sinceCheck = 0, rebuilds = 0;
+
+function medianFps(xs) {
+  const s = [...xs].sort((a, b) => a - b);
+  return 1000 / s[s.length >> 1];
+}
+
 // MediaPipe cost scales with input resolution, and detection runs every frame.
 // Feeding it the full 960x720 capture is what produced 5 fps; a downscaled
 // copy is enough for landmark accuracy. Keypoints come back normalized, so
@@ -267,25 +281,30 @@ async function loop() {
     drawOverlay(lm);
     el("sHand").textContent = lm ? "yes" : "no";
 
+    // Do the per-frame capture work in BOTH phases, so the rate we measure is
+    // the rate the real loop runs at rather than a cheaper version of it.
+    let kx = null, ky = null;
+    if (lm) {
+      kx = lm.map(p => p.x); ky = lm.map(p => p.y);
+      ring.push({ idx: frameIdx, canvas: snapshot(handBox(lm)) });
+      if (ring.length > RING) ring.shift();
+    }
+
+    if (lastFrameTs) {
+      const dt = now - lastFrameTs;
+      intervals.push(dt);
+      recent.push(dt);
+      if (recent.length > RECHECK_EVERY * 2) recent.shift();
+    }
+    lastFrameTs = now;
+
     if (!measuredFps) {
-      if (warmup++ >= WARMUP_FRAMES) {
-        if (lastFrameTs) intervals.push(now - lastFrameTs);
-        if (intervals.length >= FPS_SAMPLES) {
-          const sorted = [...intervals].sort((a, b) => a - b);
-          const median = sorted[sorted.length >> 1];
-          measuredFps = Math.max(1, Math.min(60, 1000 / median));
-          el("sFps").textContent = measuredFps.toFixed(1);
-          buildSegmenter(measuredFps);
-        }
+      if (warmup++ >= WARMUP_FRAMES && intervals.length >= FPS_SAMPLES) {
+        measuredFps = Math.max(1, Math.min(60, medianFps(intervals)));
+        el("sFps").textContent = measuredFps.toFixed(1);
+        buildSegmenter(measuredFps);
       }
-      lastFrameTs = now;
     } else {
-      let kx = null, ky = null;
-      if (lm) {
-        kx = lm.map(p => p.x); ky = lm.map(p => p.y);
-        ring.push({ idx: frameIdx, canvas: snapshot(handBox(lm)) });
-        if (ring.length > RING) ring.shift();
-      }
       const holds = segmenter.push(kx, ky);
       // below the viable framerate the windows degenerate and essentially
       // everything reads as a hold, so show nothing rather than nonsense
@@ -295,12 +314,19 @@ async function loop() {
       frameIdx++;
       drawTrace();
 
-      // keep the displayed rate live (it drifts as load changes)
-      if (lastFrameTs) {
-        const inst = 1000 / Math.max(1, now - lastFrameTs);
-        el("sFps").textContent = (0.9 * parseFloat(el("sFps").textContent) + 0.1 * inst).toFixed(1);
+      if (++sinceCheck >= RECHECK_EVERY && recent.length >= RECHECK_EVERY) {
+        sinceCheck = 0;
+        const live = medianFps(recent);
+        el("sFps").textContent = live.toFixed(1);
+        if (Math.abs(live - segmenter.fps) / segmenter.fps > DRIFT_TOLERANCE) {
+          // reconfigure to the rate we are actually achieving
+          measuredFps = Math.max(1, Math.min(60, live));
+          buildSegmenter(measuredFps);
+          rebuilds++;
+          frameIdx = 0; ring.length = 0; trace.length = 0; traceHolds.length = 0;
+          el("sCfg").textContent += `  (retuned x${rebuilds})`;
+        }
       }
-      lastFrameTs = now;
     }
   }
   requestAnimationFrame(loop);
@@ -346,6 +372,7 @@ el("start").onclick = async () => {
 el("reset").onclick = () => {
   frameIdx = 0; holdCount = 0;
   trace.length = 0; traceHolds.length = 0; ring.length = 0;
+  recent.length = 0; sinceCheck = 0;
   el("holds").innerHTML = ""; el("sHolds").textContent = "0";
   if (measuredFps) buildSegmenter(measuredFps);
 };
