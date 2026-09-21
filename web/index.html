@@ -45,6 +45,10 @@
     color: var(--accent); font-size: 10px; padding: 1px 4px; border-bottom-right-radius: 5px;
   }
   .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .warnbox {
+    background: #3a2a10; border: 1px solid #7c5a17; color: #fcd77f;
+    border-radius: 7px; padding: 9px 11px; font-size: 12.5px; margin-bottom: 10px;
+  }
   code { background: #101319; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   #status { color: var(--warn); }
 </style>
@@ -78,7 +82,9 @@
   </div>
 
   <div class="panel">
-    <div class="stat"><span>camera fps</span><span id="sFps">&mdash;</span></div>
+    <div id="warn" class="warnbox" hidden></div>
+    <div class="stat"><span>processing fps</span><span id="sFps">&mdash;</span></div>
+    <div class="stat"><span>inference</span><span id="sDel">&mdash;</span></div>
     <div class="stat"><span>hand detected</span><span id="sHand">&mdash;</span></div>
     <div class="stat"><span>holds detected</span><span id="sHolds">0</span></div>
     <div class="stat"><span>latency</span><span id="sLat">&mdash;</span></div>
@@ -94,7 +100,7 @@
 <script type="module">
 import { HandLandmarker, FilesetResolver } from
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
-import { StreamingSegmenter } from "./sofi_streaming.js";
+import { StreamingSegmenter, MIN_VIABLE_FPS } from "./sofi_streaming.js";
 
 const V = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/" +
@@ -116,8 +122,22 @@ let segmenter = null, frameIdx = 0, holdCount = 0;
 let lastTs = -1;
 
 // fps estimation before the segmenter is built — its parameters are durations,
-// so they need the real camera rate to convert correctly
-let fpsSamples = [], measuredFps = 0;
+// so they need the real processing rate to convert correctly.
+// The first frames are model/WASM warm-up and are several times slower than
+// steady state; including them badly underestimates fps, which then collapses
+// the derived window sizes. Skip them, then use the MEDIAN interval so one
+// stall does not drag the estimate down.
+const WARMUP_FRAMES = 20, FPS_SAMPLES = 30;
+let intervals = [], warmup = 0, lastFrameTs = 0, measuredFps = 0;
+
+// MediaPipe cost scales with input resolution, and detection runs every frame.
+// Feeding it the full 960x720 capture is what produced 5 fps; a downscaled
+// copy is enough for landmark accuracy. Keypoints come back normalized, so
+// the coordinates are unaffected by this.
+const DETECT_W = 320, DETECT_H = 240;
+const small = document.createElement("canvas");
+small.width = DETECT_W; small.height = DETECT_H;
+const sctx = small.getContext("2d", { willReadFrequently: true });
 
 // The hold is confirmed `delay` frames after it occurred, so the frame we want
 // to show has already gone by. Keep a short ring buffer of recent frames.
@@ -204,6 +224,17 @@ function buildSegmenter(fps) {
   el("sLat").textContent = `${Math.round(segmenter.latencyMs)} ms (${segmenter.delay} frames)`;
   el("sCfg").textContent = `${segmenter.smoothWin} / ${segmenter.run} / ${segmenter.minSep}`;
   el("delayNote").textContent = `${Math.round(segmenter.latencyMs)} ms later`;
+
+  const warn = el("warn");
+  if (!segmenter.viable) {
+    warn.hidden = false;
+    warn.innerHTML = `<b>Too slow to segment reliably (${fps.toFixed(1)} fps).</b><br>
+      Below ${MIN_VIABLE_FPS} fps the detection windows collapse to a couple of frames and
+      almost every wobble reads as a hold, so results are suppressed rather than shown as
+      nonsense. Try closing other tabs, or a machine with working WebGL.`;
+  } else {
+    warn.hidden = true;
+  }
 }
 
 function onHold(h) {
@@ -228,32 +259,48 @@ async function loop() {
   const now = performance.now();
   if (video.readyState >= 2 && now !== lastTs) {
     lastTs = now;
-    const res = landmarker.detectForVideo(video, now);
+
+    // detect on a downscaled copy — normalized landmarks are unaffected
+    sctx.drawImage(video, 0, 0, DETECT_W, DETECT_H);
+    const res = landmarker.detectForVideo(small, now);
     const lm = res.landmarks && res.landmarks.length ? res.landmarks[0] : null;
     drawOverlay(lm);
     el("sHand").textContent = lm ? "yes" : "no";
 
     if (!measuredFps) {
-      fpsSamples.push(now);
-      if (fpsSamples.length > 40) {
-        const dt = (fpsSamples.at(-1) - fpsSamples[0]) / (fpsSamples.length - 1);
-        measuredFps = Math.max(5, Math.min(60, 1000/dt));
-        el("sFps").textContent = measuredFps.toFixed(1);
-        buildSegmenter(measuredFps);
+      if (warmup++ >= WARMUP_FRAMES) {
+        if (lastFrameTs) intervals.push(now - lastFrameTs);
+        if (intervals.length >= FPS_SAMPLES) {
+          const sorted = [...intervals].sort((a, b) => a - b);
+          const median = sorted[sorted.length >> 1];
+          measuredFps = Math.max(1, Math.min(60, 1000 / median));
+          el("sFps").textContent = measuredFps.toFixed(1);
+          buildSegmenter(measuredFps);
+        }
       }
+      lastFrameTs = now;
     } else {
-      let kx = null, ky = null, box = null;
+      let kx = null, ky = null;
       if (lm) {
         kx = lm.map(p => p.x); ky = lm.map(p => p.y);
-        box = handBox(lm);
-        ring.push({ idx: frameIdx, canvas: snapshot(box) });
+        ring.push({ idx: frameIdx, canvas: snapshot(handBox(lm)) });
         if (ring.length > RING) ring.shift();
       }
-      for (const h of segmenter.push(kx, ky)) onHold(h);
+      const holds = segmenter.push(kx, ky);
+      // below the viable framerate the windows degenerate and essentially
+      // everything reads as a hold, so show nothing rather than nonsense
+      if (segmenter.viable) for (const h of holds) onHold(h);
       trace.push(segmenter.smooth.at(-1) ?? 0);
       if (trace.length > 1200) trace.shift();
       frameIdx++;
       drawTrace();
+
+      // keep the displayed rate live (it drifts as load changes)
+      if (lastFrameTs) {
+        const inst = 1000 / Math.max(1, now - lastFrameTs);
+        el("sFps").textContent = (0.9 * parseFloat(el("sFps").textContent) + 0.1 * inst).toFixed(1);
+      }
+      lastFrameTs = now;
     }
   }
   requestAnimationFrame(loop);
@@ -264,10 +311,22 @@ el("start").onclick = async () => {
   try {
     el("status").textContent = "loading model…";
     const vision = await FilesetResolver.forVisionTasks(`${V}/wasm`);
-    landmarker = await HandLandmarker.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: MODEL, delegate: "GPU" },
-      runningMode: "VIDEO", numHands: 1,
-    });
+    // GPU delegate is several times faster; fall back explicitly rather than
+    // silently ending up on CPU at 5 fps with no indication why
+    let delegate = "GPU";
+    try {
+      landmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL, delegate: "GPU" },
+        runningMode: "VIDEO", numHands: 1,
+      });
+    } catch {
+      delegate = "CPU";
+      landmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL, delegate: "CPU" },
+        runningMode: "VIDEO", numHands: 1,
+      });
+    }
+    el("sDel").textContent = `${delegate} @ ${DETECT_W}x${DETECT_H}`;
     el("status").textContent = "requesting camera…";
     stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });

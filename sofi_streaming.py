@@ -46,6 +46,37 @@ RUN_SEC = DEFAULT_RUN / TUNED_FPS             # 0.14 s
 MIN_SEP_SEC = DEFAULT_MIN_SEP / TUNED_FPS     # 0.30 s
 SEG_LEN_SEC = DEFAULT_SEG_LEN / TUNED_FPS     # 0.22 s
 
+# Below this the duration->frame conversion degenerates (at 5 fps it yields
+# smooth=1, run=1, which makes almost every frame a "local minimum" and emits
+# dozens of spurious holds). 15 fps is the lowest rate measured in
+# streaming_segmentation.ipynb that still holds MAE near 1.2-1.4.
+MIN_VIABLE_FPS = 14.0
+
+# Hard floors so that even a misconfigured instance cannot become degenerate.
+MIN_SMOOTH, MIN_RUN, MIN_SEP = 3, 2, 3
+
+# A detector dropout shorter than this is treated as MediaPipe blinking while
+# the hand is still there (interpolate across it, keep any hold); anything
+# longer means the hand has genuinely left frame (suppress holds).
+#
+# The distinction matters: a blunt "reject any window containing an undetected
+# frame" rule costs real accuracy on the dataset (MAE 1.23 -> 1.45), because
+# the clips it hits are signer5-R mid-signing dropouts, which offline
+# interpolation handles correctly. It is only *sustained* absence that creates
+# the spurious entering/leaving holds seen live.
+GAP_TOLERANCE_SEC = 0.20
+
+# A hold is a dip *between transitions*, so the surrounding motion must rise
+# above it. This ratio -- peak OFI in the +/-run window over the OFI at the
+# minimum -- is the live counterpart of the offline `mean_pick_depth`
+# diagnostic, and like the rest of Algorithm 2 it is scale-free.
+#
+# Needed because dataset clips are pre-trimmed to actual signing, whereas a
+# live hand can sit idle in frame. Without it, idle jitter yields ~1.5
+# spurious holds/second. Measured over the 218 validation clips vs simulated
+# idle jitter: 1.10 keeps 98.5% of real holds and rejects 93% of idle ones.
+MIN_CONTRAST = 1.10
+
 
 def frames_for(seconds: float, fps: float, odd: bool = False, minimum: int = 1) -> int:
     """Convert a duration to a frame count at the given fps."""
@@ -74,16 +105,31 @@ class StreamingSegmenter:
 
     def __init__(self, fps: float = TUNED_FPS, smooth_sec: float = SMOOTH_SEC,
                  run_sec: float = RUN_SEC, min_sep_sec: float = MIN_SEP_SEC,
-                 seg_len_sec: float = SEG_LEN_SEC):
+                 seg_len_sec: float = SEG_LEN_SEC, require_hand: bool = True,
+                 gap_tolerance_sec: float = GAP_TOLERANCE_SEC,
+                 min_contrast: float = MIN_CONTRAST):
         self.fps = float(fps)
-        self.smooth_win = frames_for(smooth_sec, fps, odd=True)
-        self.run = frames_for(run_sec, fps)
-        self.min_sep = frames_for(min_sep_sec, fps)
+        self.smooth_win = max(MIN_SMOOTH, frames_for(smooth_sec, fps, odd=True))
+        if self.smooth_win % 2 == 0:
+            self.smooth_win += 1
+        self.run = max(MIN_RUN, frames_for(run_sec, fps))
+        self.min_sep = max(MIN_SEP, frames_for(min_sep_sec, fps))
         self.seg_len = frames_for(seg_len_sec, fps, odd=True)
         self.delay = max((self.smooth_win - 1) // 2, self.run, self.min_sep)
 
+        # Live input contains long stretches with no hand in frame, which the
+        # dataset clips do not. Without this, the motion spikes as the hand
+        # enters and leaves create troughs between them that look exactly like
+        # holds -- one still hand waved into and out of frame produced 2 holds,
+        # and a real session produced 47.
+        self.require_hand = require_hand
+        self.gap_tolerance = max(1, frames_for(gap_tolerance_sec, fps))
+        self.min_contrast = float(min_contrast)
+        self.viable = self.fps >= MIN_VIABLE_FPS
+
         self._raw = []          # raw OFI per frame
         self._smooth = []       # centred-smoothed OFI, valid up to t - half
+        self._present = []      # was a hand detected on this frame?
         self._prev = None       # previous frame's keypoints
         self._n = 0             # frames pushed
         self._half = (self.smooth_win - 1) // 2
@@ -96,11 +142,13 @@ class StreamingSegmenter:
     # -- internals ---------------------------------------------------------
     def _push_ofi(self, kx, ky):
         """Append this frame's raw motion intensity."""
+        self._present.append(kx is not None and ky is not None)
         if kx is None or ky is None:
             # MediaPipe lost the hand. Offline we interpolate; live we cannot
-            # see the future, so carry the last pose forward (zero motion) and
-            # let the hold logic treat it as stillness.
-            self._raw.append(0.0 if self._prev is None else 0.0)
+            # see the future, so carry the last pose forward (zero motion).
+            # These frames are marked absent so `require_hand` can reject any
+            # minimum whose window touches them.
+            self._raw.append(0.0)
         else:
             cur = np.stack([np.asarray(kx, float), np.asarray(ky, float)], axis=1)
             if self._prev is None:
@@ -120,6 +168,31 @@ class StreamingSegmenter:
             hi = min(self._n, i + self._half + 1)
             self._smooth.append(float(np.mean(self._raw[lo:hi])))
 
+    def _blocked(self, i: int) -> bool:
+        """True if the +/-run window around frame i touches a sustained absence.
+
+        A run of >= gap_tolerance consecutive undetected frames means the hand
+        left the frame. Anything shorter is a detector blink and is ignored.
+        """
+        lo = max(0, i - self.run)
+        hi = min(len(self._present), i + self.run + 1)
+        j = lo
+        while j < hi:
+            if self._present[j]:
+                j += 1
+                continue
+            # measure this gap in full, including outside the window
+            start = j
+            while start > 0 and not self._present[start - 1]:
+                start -= 1
+            end = j
+            while end + 1 < len(self._present) and not self._present[end + 1]:
+                end += 1
+            if end - start + 1 >= self.gap_tolerance:
+                return True
+            j = end + 1
+        return False
+
     def _scan_minima(self):
         """Find newly-confirmable local minima in the smoothed signal."""
         s = self._smooth
@@ -128,8 +201,12 @@ class StreamingSegmenter:
         while i <= limit:
             w = s[i - self.run: i + self.run + 1]
             c = s[i]
-            if c <= min(w) + 1e-12 and w[0] > c and w[-1] > c:
-                self._pending.append((i, c))
+            if c <= min(w) + 1e-12 and w[0] > c and w[-1] > c                     and max(w) >= self.min_contrast * (c + 1e-12):
+                # reject minima whose window overlaps a SUSTAINED absence --
+                # those are artefacts of the hand entering or leaving frame,
+                # not holds. Short dropouts are detector blinks and are kept.
+                if not self.require_hand or not self._blocked(i):
+                    self._pending.append((i, c))
             self._scanned_to = i
             i += 1
 

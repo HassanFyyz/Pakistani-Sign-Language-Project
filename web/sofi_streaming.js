@@ -18,6 +18,23 @@ export const RUN_SEC = 7 / TUNED_FPS;       // 0.14 s
 export const MIN_SEP_SEC = 15 / TUNED_FPS;  // 0.30 s
 export const SEG_LEN_SEC = 11 / TUNED_FPS;  // 0.22 s
 
+// Below this the duration->frame conversion degenerates: at 5 fps it yields
+// smooth=1, run=1, so nearly every frame is a "local minimum". A real session
+// at 5 fps produced 47 spurious holds.
+export const MIN_VIABLE_FPS = 14.0;
+
+// Hard floors so a misconfigured instance can never become degenerate.
+const MIN_SMOOTH = 3, MIN_RUN = 2, MIN_SEP = 3;
+
+// Dropouts shorter than this are MediaPipe blinking while the hand is still
+// there; longer means the hand genuinely left frame.
+export const GAP_TOLERANCE_SEC = 0.20;
+
+// Peak OFI in the window over OFI at the minimum. A hold is a dip *between*
+// transitions, so the surrounding motion must rise above it. Live-only:
+// dataset clips are pre-trimmed to actual signing, a live hand can sit idle.
+export const MIN_CONTRAST = 1.10;
+
 function framesFor(seconds, fps, odd = false, minimum = 1) {
   let n = Math.max(minimum, Math.round(seconds * fps));
   if (odd && n % 2 === 0) n += 1;
@@ -40,17 +57,27 @@ export class StreamingSegmenter {
    * @param {number} [opts.segLenSec] emitted hold span, seconds
    */
   constructor({ fps = TUNED_FPS, smoothSec = SMOOTH_SEC, runSec = RUN_SEC,
-                minSepSec = MIN_SEP_SEC, segLenSec = SEG_LEN_SEC } = {}) {
+                minSepSec = MIN_SEP_SEC, segLenSec = SEG_LEN_SEC,
+                requireHand = true, gapToleranceSec = GAP_TOLERANCE_SEC,
+                minContrast = MIN_CONTRAST } = {}) {
     this.fps = fps;
-    this.smoothWin = framesFor(smoothSec, fps, true);
-    this.run = framesFor(runSec, fps);
-    this.minSep = framesFor(minSepSec, fps);
+    this.smoothWin = Math.max(MIN_SMOOTH, framesFor(smoothSec, fps, true));
+    if (this.smoothWin % 2 === 0) this.smoothWin += 1;
+    this.run = Math.max(MIN_RUN, framesFor(runSec, fps));
+    this.minSep = Math.max(MIN_SEP, framesFor(minSepSec, fps));
     this.segLen = framesFor(segLenSec, fps, true);
     this.half = (this.smoothWin - 1) >> 1;
     this.delay = Math.max(this.half, this.run, this.minSep);
 
+    this.requireHand = requireHand;
+    this.gapTolerance = Math.max(1, framesFor(gapToleranceSec, fps));
+    this.minContrast = minContrast;
+    /** False when the camera is too slow for the method to behave sensibly. */
+    this.viable = fps >= MIN_VIABLE_FPS;
+
     this.raw = [];
     this.smooth = [];
+    this.present = [];
     this.prev = null;
     this.n = 0;
     this.pending = [];
@@ -86,9 +113,11 @@ export class StreamingSegmenter {
   }
 
   _pushOfi(kx, ky) {
+    this.present.push(kx != null && ky != null);
     if (kx == null || ky == null) {
       // MediaPipe lost the hand. We cannot interpolate forward in a live
-      // stream, so treat it as stillness and carry the last pose.
+      // stream, so carry the last pose. Marked absent so _blocked() can
+      // reject minima that sit inside a sustained gap.
       this.raw.push(0.0);
     } else if (this.prev === null) {
       this.raw.push(0.0);
@@ -115,17 +144,37 @@ export class StreamingSegmenter {
     }
   }
 
+  /** True if the +/-run window around i touches a sustained absence. */
+  _blocked(i) {
+    const lo = Math.max(0, i - this.run);
+    const hi = Math.min(this.present.length, i + this.run + 1);
+    let j = lo;
+    while (j < hi) {
+      if (this.present[j]) { j++; continue; }
+      let start = j;
+      while (start > 0 && !this.present[start - 1]) start--;
+      let end = j;
+      while (end + 1 < this.present.length && !this.present[end + 1]) end++;
+      if (end - start + 1 >= this.gapTolerance) return true;
+      j = end + 1;
+    }
+    return false;
+  }
+
   _scanMinima() {
     const s = this.smooth;
     const limit = s.length - this.run - 1;
     let i = Math.max(this.scannedTo + 1, this.run);
     for (; i <= limit; i++) {
       const c = s[i];
-      let isMin = true;
+      let isMin = true, peak = -Infinity;
       for (let j = i - this.run; j <= i + this.run; j++) {
         if (s[j] < c - 1e-12) { isMin = false; break; }
+        if (s[j] > peak) peak = s[j];
       }
-      if (isMin && s[i - this.run] > c && s[i + this.run] > c) {
+      if (isMin && s[i - this.run] > c && s[i + this.run] > c &&
+          peak >= this.minContrast * (c + 1e-12) &&
+          (!this.requireHand || !this._blocked(i))) {
         this.pending.push([i, c]);
       }
       this.scannedTo = i;

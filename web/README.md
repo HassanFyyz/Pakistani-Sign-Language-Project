@@ -38,6 +38,22 @@ no honest model to plug in yet. The page shows segmentation only rather than emi
 | `sofi_streaming.js` | JS port of `sofi_streaming.py`, byte-identical output |
 | `test_parity.mjs` | replays real clips through the JS port and diffs against Python |
 
+## Three live-only behaviours that do not exist offline
+
+Dataset clips are pre-trimmed to a signer actively fingerspelling. A camera also sees an empty
+frame, a hand arriving, and a hand resting — and the unmodified algorithm reports holds for all
+three. The first live test produced **47 holds in one session at 5 fps**. The fixes:
+
+| Guard | What it stops |
+|---|---|
+| `MIN_VIABLE_FPS` + parameter floors | at 5 fps the durations round to `smooth=1, run=1`, so nearly every frame is a "minimum". Below the threshold the page reports nothing rather than nonsense |
+| `GAP_TOLERANCE_SEC` | the motion spikes as a hand enters and leaves leave a trough between them that looks exactly like a hold. Only *sustained* absence is suppressed — short dropouts are detector blinks and are kept, because rejecting those costs real accuracy (MAE 1.23 → 1.45) |
+| `MIN_CONTRAST` | an idle hand yields ~1.5 spurious holds/sec. A hold is a dip *between* transitions, so the surrounding peak must exceed it by a ratio. 1.10 keeps 98.5 % of real holds, rejects 93 % of idle ones |
+
+The page also runs detection on a downscaled (320×240) copy of the frame and reports which
+delegate (GPU/CPU) it got — feeding MediaPipe the full 960×720 capture every tick is what
+produced 5 fps in the first place.
+
 ## Two things to know before changing anything
 
 **The algorithm is causal but delayed.** A hold is confirmed `delay` frames after it happened
