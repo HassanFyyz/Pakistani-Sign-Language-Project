@@ -50,6 +50,14 @@
 
     Worth noting for the writeup: none of these were findable offline. The streaming version is now deliberately *stricter* than the batch one rather than a pure port, which is the correct relationship — it sees input the offline algorithm was never given.
 
+11. **Per-letter reference sheets — and they resolve the fork** (`letter_reference.ipynb`, `letter_sheets/`). The per-clip spot-check sheets asked "is segment *i* really letter *i*?", which needs PSL expertise nobody on this project has. The per-letter sheets ask a question anyone can answer: *do these images show the same handshape?* Each sheet collects every occurrence of one letter across different words and different signers.
+
+    **Verdict: the pseudo-labels are good.** `چ` shows 8 occurrences across 4 signers and 2 different words, at different positions within those words — all visibly the same handshape. This was the open question blocking everything: whether `letter_classifier.ipynb`'s failure meant bad labels or bad features. It's the features.
+
+    The cleanest evidence is `پ`, which scores **worst** on feature-space self-consistency (ratio 0.55) yet is visually one of the most consistent sheets — 5 signers, same pose. A label problem cannot look like that; only a representation problem can. Caveat: `پ` occurs in one word only, so it tests cross-signer but not cross-word generalization; `چ` tests both.
+
+    Also visible in `_alphabet.png`: a large family of letters that are near-identical fist variants in 2D, differing only in thumb position and finger contact. That is a direct visual explanation for why 2D landmark geometry cannot separate them. Two exemplars are bad picks (`ت` catches motion blur, `ج` catches a face) — the dataset's "cropped" videos are not uniformly hand-cropped.
+
 **Immediate next actions (in progress or queued):**
 - [ ] **Train a small CNN on the hand crops at the segmented hold frames** — the crops already exist, the segmenter already says which frames to use, and the result above says appearance is where the missing signal must be. This is the direct next experiment.
 - [ ] Human spot-check of `spot_check/*.png` (needs someone who reads Urdu + knows PSL handshapes) to put a number on pseudo-label noise. Two sheets inspected informally look clean — distinct, settled handshapes matching the captions.
@@ -74,6 +82,8 @@ Run the notebooks in this order; each depends on the artifacts of the previous o
 | `sofi_algorithm2.ipynb` | Algorithm 2 validation: strict vs tolerant, parameter sweep, vs Algorithm 1, LOSO |
 | `pseudo_labeling.ipynb` | Builds the pseudo-labels, diagnostics, exports, and the spot-check contact sheets |
 | `letter_classifier.ipynb` | Letter classification + the negative result and its controls |
+| `letter_reference.ipynb` | Per-letter sheets + the alphabet reference; the label-verification step |
+| `letter_sheets/` | One sheet per letter, plus `_alphabet.png` (one exemplar each) |
 | `sofi_streaming.py` | **Causal** Algorithm 2 for live input. Parameters in *seconds*, not frames |
 | `streaming_segmentation.ipynb` | Streaming-vs-offline parity, framerate transfer, browser parity test |
 | `web/` | Stage-1 demo app: live segmentation in the browser (`web/README.md` to run it) |
@@ -181,7 +191,7 @@ The end deliverable is a **live camera → segmented video → recognized letter
 - [x] Build leave-one-signer-out / leave-one-angle-out evaluation protocol — *now applied for real: LOSO on segmentation (Algorithm 2) and on letter classification, with label-shuffle controls, occurrence-level grouping, and a demonstration that frame-level splits inflate results 10.9×*
 - [~] Replace heuristic segmentation with a learned boundary detector — *Algorithm 2 (dynamic local-minima) built and validated, 3.5× better than Algorithm 1 and LOSO-stable. Still a heuristic, not learned — but it is now a strong baseline for a learned detector to beat*
 - [x] Build letter-level labels without the missing annotations — *constrained-DP pseudo-labelling, 14,530 hold frames across 40 classes*
-- [ ] **Appearance-based letter model (CNN on hand crops at hold frames)** — *the key open experiment; keypoint-geometry features are proven insufficient*
+- [ ] **Appearance-based letter model (CNN on hand crops at hold frames)** — *the key open experiment, and no longer a gamble: the per-letter sheets confirm the labels are sound, so a CNN would be training on good data. Keypoint-geometry features are proven insufficient*
 - [ ] Replace heuristic post-processing (consecutive-count / mode) with CTC or temporal transformer decoding
 - [ ] Multi-seed runs + reported variance for all experiments
 - [ ] Extend to dynamic/motion letters
